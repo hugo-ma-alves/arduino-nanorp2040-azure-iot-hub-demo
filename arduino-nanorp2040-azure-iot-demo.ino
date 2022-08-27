@@ -47,11 +47,11 @@ void loop() {
 
   Serial.print("temperature = ");
   Serial.println(temperature);
-  upload_metric("temperature", temperature);
+  upload_telemetry(temperature);
 
   telemetry_poll();
 
-  delay(1000);
+  delay(5000);
 }
 
 static float read_temperature() {

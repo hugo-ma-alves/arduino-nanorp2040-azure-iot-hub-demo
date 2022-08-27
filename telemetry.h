@@ -5,7 +5,7 @@
 #include <Arduino.h>
 
 //All function prototypes from telemetry.cpp.
-void upload_metric(const char name[], float value);
+void upload_telemetry(float temperature);
 
 //Should be called frequently to keep the connection active
 void telemetry_poll();

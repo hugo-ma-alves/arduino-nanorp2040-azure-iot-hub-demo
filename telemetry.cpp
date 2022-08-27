@@ -1,3 +1,5 @@
+#include "az_result.h"
+#include "az_json.h"
 #include <Arduino.h>
 
 //Wifi libraries
@@ -27,6 +29,10 @@
 #define SAS_HMAC256_ENCRYPTED_SIGNATURE_BUFFER_SIZE 32
 #define DECODED_SAS_KEY_BUFFER_SIZE 32
 
+#define TELEMETRY_PROPERTY_TEMPERATURE "temperature"
+#define TELEMETRY_PROPERTY_DEVICE_NAME "deviceId"
+#define DEVICE_NAME "arduino_nano_rp2040"
+
 // When developing for your own Arduino-based platform,
 // please follow the format '(ard;<platform>)'.
 #define AZURE_SDK_CLIENT_USER_AGENT "c%2F" AZ_SDK_VERSION_STRING "(ard;rp2040)"
@@ -53,16 +59,15 @@ static void initialize_mqtt_client();
 static void establish_connection();
 static void generate_mqtt_password();
 static void connect_to_azure_iot_hub();
-static void build_telemetry_payload(const char name[], float value, char *payloadBuffer);
-static void stop();
+static void build_telemetry_payload(float temperature, char *out_payload_buffer, size_t payload_buffer_size, size_t *payload_buffer_length);
+static void stop_if_fail(az_result rc, char const *message);
 static uint64_t get_time();
 
 /**
 * Uploads the specified metric to Azure iot hub.
-* It creates a json payload with the format { "deviceId": "$name", "metric": "temperature", "value": $value}
+* It sends a json payload with the format {"deviceId":"arduino", "temperature":25.61,"OtherMetric":10}
 */
-void upload_metric(const char name[], float value) {
-  digitalWrite(LEDG, HIGH);
+void upload_telemetry(float temperature) {
   // if not connected connect and send metric
   // Check if connected, reconnect if needed.
   if (!mqtt_client.connected()) {
@@ -73,16 +78,26 @@ void upload_metric(const char name[], float value) {
     establish_connection();
   }
 
+  digitalWrite(LEDG, HIGH);
   char payloadBuffer[MAX_TELEMETRY_PAYLOAD_SIZE];
-  build_telemetry_payload(name, value, payloadBuffer);
+  size_t payload_size;
+  build_telemetry_payload(temperature, payloadBuffer, MAX_TELEMETRY_PAYLOAD_SIZE, &payload_size);
+  //Serial.println(payloadBuffer);
 
-  mqtt_client.publish(telemetry_topic, payloadBuffer, false);
-  Serial.println("Metric sent to Iot hub");
-
+  boolean success = mqtt_client.publish(telemetry_topic, (char *)payloadBuffer, false);
   digitalWrite(LEDG, LOW);
+  if (success) {
+    Serial.println("Metric sent to Iot hub");
+  } else {
+    digitalWrite(LEDR, HIGH);
+    delay(1000);
+    digitalWrite(LEDR, LOW);
+    Serial.print("Failed to send metric with the state ");
+    Serial.println(mqtt_client.state());
+  }
 }
 
-void telemetry_poll(){
+void telemetry_poll() {
   // This should be called regularly to allow the client to process incoming messages and maintain its connection to the server.
   mqtt_client.loop();
 }
@@ -95,12 +110,14 @@ static uint64_t get_time() {
 * Estblishes wifi and the mqtt connection
 */
 static void establish_connection() {
+  digitalWrite(LEDB, HIGH);
   //Initialize azure sdk client and the mqtt client
   initialize_mqtt_client();
   //Generate the SAS token (mqtt password)
   generate_mqtt_password();
   //Connects to azure using the mqtt protocol
   connect_to_azure_iot_hub();
+  digitalWrite(LEDB, LOW);
 }
 
 static void connect_to_azure_iot_hub() {
@@ -109,21 +126,13 @@ static void connect_to_azure_iot_hub() {
   az_result rc;
 
   rc = az_iot_hub_client_get_client_id(&iothub_client, mqtt_client_id, sizeof(mqtt_client_id) - 1, &client_id_length);
-  if (az_result_failed(rc)) {
-    Serial.print("[ERROR] Failed getting client id");
-    Serial.println(rc);
-    stop();
-  }
+  stop_if_fail(rc, "[ERROR] Failed getting client id");
   mqtt_client_id[client_id_length] = '\0';
 
   char mqtt_username[MQTT_USERNAME_BUFFER_SIZE];
   // Get the MQTT user name used to connect to IoT Hub
   rc = az_iot_hub_client_get_user_name(&iothub_client, mqtt_username, sizeofarray(mqtt_username), NULL);
-  if (az_result_failed(rc)) {
-    Serial.print("[ERROR] Failed to get MQTT clientId, return code");
-    Serial.println(rc);
-    stop();
-  }
+  stop_if_fail(rc, "[ERROR] Failed to get MQTT clientId");
 
   Serial.print("Client ID: ");
   Serial.println(mqtt_client_id);
@@ -147,11 +156,7 @@ static void connect_to_azure_iot_hub() {
   //Cloud to device topic, another tutorial
   //mqtt_client.subscribe(AZ_IOT_HUB_CLIENT_C2D_SUBSCRIBE_TOPIC);
   rc = az_iot_hub_client_telemetry_get_publish_topic(&iothub_client, NULL, telemetry_topic, sizeof(telemetry_topic), NULL);
-  if (az_result_failed(rc)) {
-    Serial.print("Failed az_iot_hub_client_telemetry_get_publish_topic with code");
-    Serial.println(rc);
-    stop();
-  }
+  stop_if_fail(rc, "Failed az_iot_hub_client_telemetry_get_publish_topic");
 }
 
 /**
@@ -163,11 +168,8 @@ static void initialize_mqtt_client() {
   az_iot_hub_client_options options = az_iot_hub_client_options_default();
   options.user_agent = AZ_SPAN_FROM_STR(AZURE_SDK_CLIENT_USER_AGENT);
 
-  az_result clientInitResult = az_iot_hub_client_init(&iothub_client, az_span_create((uint8_t *)host, strlen(host)), az_span_create((uint8_t *)device_id, strlen(device_id)), &options);
-  if (az_result_failed(clientInitResult)) {
-    Serial.println("Failed initializing Azure IoT Hub client");
-    stop();
-  }
+  az_result rc = az_iot_hub_client_init(&iothub_client, az_span_create((uint8_t *)host, strlen(host)), az_span_create((uint8_t *)device_id, strlen(device_id)), &options);
+  stop_if_fail(rc, "Failed initializing Azure IoT Hub client");
 
   mqtt_client.setServer(host, port);
   mqtt_client.setBufferSize(MQTT_PACKET_SIZE);
@@ -186,8 +188,7 @@ static void base64_encode_bytes(az_span decoded_bytes, az_span base64_encoded_by
   if (mbedtls_base64_encode(az_span_ptr(base64_encoded_bytes), (size_t)az_span_size(base64_encoded_bytes),
                             &len, az_span_ptr(decoded_bytes), (size_t)az_span_size(decoded_bytes))
       != 0) {
-    Serial.println("[ERROR] mbedtls_base64_encode fail");
-    stop();
+    stop_if_fail(AZ_ERROR_CANCELED, "[ERROR] mbedtls_base64_encode fail");
   }
 
   *out_base64_encoded_bytes = az_span_create(az_span_ptr(base64_encoded_bytes), (int32_t)len);
@@ -201,8 +202,7 @@ static void decode_base64_bytes(az_span base64_encoded_bytes, az_span decoded_by
   if (mbedtls_base64_decode(az_span_ptr(decoded_bytes), (size_t)az_span_size(decoded_bytes),
                             &len, az_span_ptr(base64_encoded_bytes), (size_t)az_span_size(base64_encoded_bytes))
       != 0) {
-    Serial.println("[ERROR] mbedtls_base64_decode fail");
-    stop();
+    stop_if_fail(AZ_ERROR_CANCELED, "[ERROR] mbedtls_base64_decode fail");
   }
 
   *out_decoded_bytes = az_span_create(az_span_ptr(decoded_bytes), (int32_t)len);
@@ -260,11 +260,7 @@ static void generate_mqtt_password() {
   // 1. Get the Gets the Shared Access clear-text signature.
   az_span sas_signature = AZ_SPAN_FROM_BUFFER(signature_buffer);
   rc = az_iot_hub_client_sas_get_signature(&iothub_client, expiration_time, sas_signature, &sas_signature);
-  if (az_result_failed(rc)) {
-    Serial.print("Could not get the signature for SAS key: az_result return code ");
-    Serial.println(rc);
-    stop();
-  }
+  stop_if_fail(rc, "Could not get the signature for SAS key.");
 
   // 2. Sign it using HMAC-SHA256 using the Shared Access Key as key
   // 3. Base64 encode the result.
@@ -275,11 +271,7 @@ static void generate_mqtt_password() {
   // 4. Builds the mqtt password
   size_t mqtt_password_lenght;
   rc = az_iot_hub_client_sas_get_password(&iothub_client, expiration_time, sas_base64_encoded_signed_signature, AZ_SPAN_EMPTY, mqtt_password, sizeof(mqtt_password), &mqtt_password_lenght);
-  if (az_result_failed(rc)) {
-    Serial.print("Could not get the password: az_result return code ");
-    Serial.println(rc);
-    stop();
-  }
+  stop_if_fail(rc, "Could not get the password.");
 
   Serial.print("Generated the following SAS (mqtt password): ");
   Serial.println(mqtt_password);
@@ -287,22 +279,47 @@ static void generate_mqtt_password() {
 
 /**
 * Creates a Json payload with the specified metric
-* The payload is stored in the payloadBuffer array  
+* [out] The generated payload is stored in the payload_buffer array
+* using it in the mqtt client
+* [out] The payload_buffer_length contains its length
 */
-static void build_telemetry_payload(const char name[], float value, char *payloadBuffer) {
-  String payload = "{ \"deviceId\": \"arduino\", \"metric\": \"";
-  payload.concat(name);
-  payload.concat("\", \"value\": ");
-  payload.concat(value);
-  payload.concat("}");
+static void build_telemetry_payload(float temperature, char *out_payload_buffer, size_t payload_buffer_size, size_t *out_payload_buffer_length) {
+  az_json_writer jw;
+  az_result rc;
+  az_span payload_buffer_span = az_span_create((uint8_t *)out_payload_buffer, payload_buffer_size);
+  rc = az_json_writer_init(&jw, payload_buffer_span, NULL);
+  stop_if_fail(rc, "Failed to build telemetry payload");
+  rc = az_json_writer_append_begin_object(&jw);
+  stop_if_fail(rc, "Failed to build telemetry payload");
 
-  payload.toCharArray(payloadBuffer, MAX_TELEMETRY_PAYLOAD_SIZE);
+  rc = az_json_writer_append_property_name(&jw, AZ_SPAN_FROM_STR(TELEMETRY_PROPERTY_TEMPERATURE));
+  stop_if_fail(rc, "Failed to build telemetry payload");
+  rc = az_json_writer_append_double(&jw, temperature, 2);
+
+  rc = az_json_writer_append_property_name(&jw, AZ_SPAN_FROM_STR(TELEMETRY_PROPERTY_DEVICE_NAME));
+  stop_if_fail(rc, "Failed to build telemetry payload");
+  rc = az_json_writer_append_string(&jw, AZ_SPAN_FROM_STR(DEVICE_NAME));
+
+  stop_if_fail(rc, "Failed to build telemetry payload");
+  rc = az_json_writer_append_end_object(&jw);
+  stop_if_fail(rc, "Failed to build telemetry payload");
+
+  payload_buffer_span = az_json_writer_get_bytes_used_in_destination(&jw);
+
+  out_payload_buffer[az_span_size(payload_buffer_span)] = '\0';
+  *out_payload_buffer_length = az_span_size(payload_buffer_span);
 }
 
-static void stop() {
+static void stop_if_fail(az_result rc, char const *message) {
+  if (!az_result_failed(rc)) {
+    return;
+  }
+
   digitalWrite(LEDB, LOW);
   digitalWrite(LEDG, LOW);
-
+  Serial.println(message);
+  Serial.print("az_result return code: ");
+  Serial.println(rc);
   while (1) {
     digitalWrite(LEDR, HIGH);
     delay(1500);
