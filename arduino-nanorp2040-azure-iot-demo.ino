@@ -20,6 +20,10 @@ const int VOLTAGE_DIVIDER_KNOWN_RESISTANCE_VALUE = 100000;
 const float KELVIN_CONVERSION_FACTOR = 273.15;
 const float REFERENCE_TEMPERATURE_K = 25.0 + KELVIN_CONVERSION_FACTOR;
 
+int metrics_upload_period_ms = 5000;
+unsigned long time_now = 0;
+unsigned long last_metric_sent_time = 0;
+
 static void connect_to_wifi();
 static float read_temperature();
 
@@ -39,19 +43,20 @@ void setup() {
 }
 
 void loop() {
+  time_now = millis();
   if (WiFi.status() != WL_CONNECTED) {
     connect_to_wifi();
   }
 
-  float temperature = read_temperature();
+  if (time_now > last_metric_sent_time + metrics_upload_period_ms) {
+    last_metric_sent_time = time_now;
+    float temperature = read_temperature();
 
-  Serial.print("temperature = ");
-  Serial.println(temperature);
-  upload_telemetry(temperature);
-
+    Serial.print("temperature = ");
+    Serial.println(temperature);
+    upload_telemetry(temperature);
+  }
   telemetry_poll();
-
-  delay(5000);
 }
 
 static float read_temperature() {
